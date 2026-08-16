@@ -410,6 +410,11 @@ mod tests {
         let docs = index.partitions[0].docs.address_keyed().await.unwrap();
         assert_eq!(docs.len(), 3, "the empty list must not become a document");
         assert_eq!(docs.num_distinct_rows(), docs.len());
+        // Also the read-pruning fast path's precondition: one document per row,
+        // stored in ascending row order. A gate that never fires would leave
+        // every score correct and silently disable the pruning.
+        assert!(docs.addresses_strictly_ascending());
+
         let terms = ["alpha".to_owned(), "beta".to_owned(), "absent".to_owned()];
         let documents = index.bm25_stats_for_terms(&terms, None).await.unwrap();
         assert_eq!(documents, (5, 3, vec![2, 2, 0]));

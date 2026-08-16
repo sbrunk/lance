@@ -100,8 +100,9 @@ tokenizer-jieba = ["dep:jieba-rs", "lance-tokenizer/tokenizer-jieba"]
 # downstream test and bench targets. Enable it as a dev-dependency feature only.
 test-oracle = []
 # Exposes `scalar::inverted::combined_fields_search_with_stats` and the
-# `MaxscoreStats` it returns, so a bench can report how much candidate scoring
-# the MAXSCORE pruning saves. Enable it as a dev-dependency feature only.
+# `CombinedScanStats` it returns, so a bench can report how much candidate
+# scoring the MAXSCORE pruning saves and how much reading the block skipping
+# saves. Enable it as a dev-dependency feature only.
 test-scan-stats = []
 
 [build-dependencies]

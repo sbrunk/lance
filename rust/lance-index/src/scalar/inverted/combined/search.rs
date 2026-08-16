@@ -14,8 +14,11 @@ use lance_core::utils::tokio::spawn_cpu;
 use super::super::documents::AddressKeyedDocuments;
 use super::super::query::{FtsSearchParams, Operator, Tokens};
 use super::super::scorer::CombinedFieldsBM25Scorer;
-use super::cursor::{LoadedSource, MaterializedTerm, build_materialized_term};
-use super::maxscore::{MaxscoreStats, combined_maxscore};
+use super::cursor::{
+    LazyTerm, LoadedSource, MaterializedTerm, build_lazy_term, build_materialized_term,
+    into_compressed_sources, record_fast_reads,
+};
+use super::maxscore::{CombinedScanStats, combined_maxscore};
 use super::{CombinedFieldColumn, unique_terms};
 use crate::metrics::MetricsCollector;
 use crate::prefilter::PreFilter;
@@ -64,6 +67,14 @@ impl RankedDoc {
 /// are discovered in ascending row-id order and [`RankedDoc`] settles ties, so
 /// neither the membership nor the order depends on heap internals.
 ///
+/// When every partition is fast-path eligible (compressed postings with strictly
+/// ascending `row_ids`, so doc-id order equals row-id order and each row owns one
+/// doc) the term cursors are block-skipping `LazyTerm`s, and a non-essential
+/// term's blocks are decoded only around the sparse candidates the essential
+/// terms surface, pruning reads and not just scoring. A legacy partition,
+/// unsorted `row_ids`, or a non-compressed posting forces the full-read
+/// `MaterializedTerm` fallback, whose result is bit-identical.
+///
 /// `operator` applies across the virtual field: `And` keeps only docs where
 /// every query term appears in at least one column; `Or` keeps docs matching
 /// any term. Per-column `boost` is folded into `tf'`.
@@ -83,16 +94,22 @@ pub async fn combined_fields_search(
     Ok((row_ids, scores))
 }
 
-/// [`combined_fields_search`] plus the [`MaxscoreStats`] of the scan, for a bench
-/// that wants to report how much candidate scoring the pruning saved.
+/// [`combined_fields_search`] plus the [`CombinedScanStats`] of the scan, for a
+/// bench that wants to report how much candidate scoring and how much reading
+/// the pruning saved.
 ///
 /// This is the whole implementation; [`combined_fields_search`] is the same call
-/// with the stats dropped. The stats are three counters the MAXSCORE loop keeps
-/// either way, so the default path does no extra work.
+/// with the stats dropped. The stats are counters both arms keep either way, so
+/// the default path does no extra work.
+///
+/// `*_read` below `*_total` is the only thing that says the block-skip fast path
+/// pruned reads; equality is ambiguous, since the fast path also decodes
+/// everything when nothing is prunable. Tests assert on it, because a gate that
+/// never fires leaves every score correct and silently disables the pruning.
 ///
 /// Reachable outside the crate only under `cfg(test)` or the `test-scan-stats`
-/// feature: per-candidate counters are not something the production
-/// `MetricsCollector` carries.
+/// feature: per-candidate, per-block and per-posting counters are not something
+/// the production [`MetricsCollector`] carries, which must stay coarse-grained.
 pub async fn combined_fields_search_with_stats(
     columns: &[CombinedFieldColumn],
     tokens: &Tokens,
@@ -101,28 +118,37 @@ pub async fn combined_fields_search_with_stats(
     scorer: &CombinedFieldsBM25Scorer,
     prefilter: Arc<dyn PreFilter>,
     metrics: &dyn MetricsCollector,
-) -> Result<(Vec<u64>, Vec<f32>, MaxscoreStats)> {
+) -> Result<(Vec<u64>, Vec<f32>, CombinedScanStats)> {
     let terms = unique_terms(tokens);
     let limit = params.limit.unwrap_or(usize::MAX);
     if terms.is_empty() || limit == 0 {
-        return Ok((Vec::new(), Vec::new(), MaxscoreStats::default()));
+        return Ok((Vec::new(), Vec::new(), CombinedScanStats::default()));
     }
 
     let mask = prefilter.mask();
     let require_all_terms = operator == Operator::And;
 
     // Load every term's postings across all columns, in the canonical
-    // column → index → partition order. The length sources are collected in that
-    // same order so `dl'` sums in the exact scan's order too (float addition is
-    // order-sensitive; matching the order keeps every score bit-identical).
+    // column → index → partition order, deciding fast-path eligibility as we
+    // go. The length sources are collected in that same order so `dl'` sums in
+    // the exact scan's order too (float addition is order-sensitive; matching
+    // the order keeps every score bit-identical).
     let mut loaded: Vec<Vec<LoadedSource>> = (0..terms.len()).map(|_| Vec::new()).collect();
     let mut length_sources: Vec<(f32, AddressKeyedDocuments)> = Vec::new();
+    // Block skipping needs doc-id order to equal row-id order in every partition,
+    // which a legacy layout or unsorted `row_ids` breaks. The remaining
+    // requirement, that every posting be compressed, is settled below by
+    // retyping the loads.
+    let mut layout_allows_skipping = true;
     for column in columns {
         let weight = column.weight;
         for index in &column.indices {
             for partition in &index.partitions {
                 let docs = partition.docs.address_keyed().await?;
                 let is_legacy = partition.is_legacy();
+                if is_legacy || !docs.addresses_strictly_ascending() {
+                    layout_allows_skipping = false;
+                }
                 for (term_index, term) in terms.iter().enumerate() {
                     let Some(token_id) = partition.tokens.get(term) else {
                         continue;
@@ -142,9 +168,20 @@ pub async fn combined_fields_search_with_stats(
             }
         }
     }
-    // Everything past the loads is uninterruptible CPU work: building and sorting
-    // a per-term `HashMap`, then the whole MAXSCORE loop with no await. Offload it
-    // so a large query cannot hold a DataFusion
+    // `Ok` is the read-pruning fast path, `Err` hands the same loads to the eager
+    // fallback. The returned stats narrow this down in one direction only:
+    // `blocks_read` under `blocks_total` proves the fast path ran, while equality
+    // is ambiguous, since the fast path also decodes everything when nothing is
+    // prunable.
+    let sources = if layout_allows_skipping {
+        into_compressed_sources(loaded)
+    } else {
+        Err(loaded)
+    };
+
+    // Everything past the loads is uninterruptible CPU work: the fallback builds
+    // and sorts a per-term `HashMap`, and both paths then run the whole MAXSCORE
+    // loop with no await. Offload it so a large query cannot hold a DataFusion
     // worker past a stream drop or task cancellation, matching how the
     // single-column `InvertedIndex::bm25_search` dispatches its per-partition
     // scoring and how `flat_combined_fields_search_stream` dispatches its own
@@ -158,25 +195,54 @@ pub async fn combined_fields_search_with_stats(
                 .map(|(weight, docs)| weight * docs.doc_length_at(row_id) as f32)
                 .sum()
         };
+        // Both arms accumulate into one `stats`: the cursors account the reads,
+        // `combined_maxscore` the candidates.
+        //
         // Cursors that are all exhausted need no special case: `combined_maxscore`
         // finds no candidate and returns an empty heap, which unzips to no hits.
-        let mut cursors: Vec<MaterializedTerm> = Vec::with_capacity(terms.len());
-        for (term, sources) in terms.iter().zip(loaded) {
-            cursors.push(build_materialized_term(
-                term,
-                sources,
-                &mask,
-                scorer.as_ref(),
-            ));
-        }
-        let result = combined_maxscore(
-            &mut cursors,
-            dl_prime,
-            limit,
-            require_all_terms,
-            scorer.as_ref(),
-        );
-        Result::Ok(result)
+        let mut stats = CombinedScanStats::default();
+        let top = match sources {
+            Ok(compressed) => {
+                let mut cursors: Vec<LazyTerm> = terms
+                    .iter()
+                    .zip(compressed)
+                    .map(|(term, sources)| build_lazy_term(term, sources, &mask, scorer.as_ref()))
+                    .collect();
+                let top = combined_maxscore(
+                    &mut cursors,
+                    dl_prime,
+                    limit,
+                    require_all_terms,
+                    scorer.as_ref(),
+                    &mut stats,
+                );
+                // Only the lazy cursors know what they skipped, so their counters
+                // are read off after the loop.
+                record_fast_reads(&cursors, &mut stats);
+                top
+            }
+            Err(loaded) => {
+                let mut cursors: Vec<MaterializedTerm> = Vec::with_capacity(terms.len());
+                for (term, sources) in terms.iter().zip(loaded) {
+                    cursors.push(build_materialized_term(
+                        term,
+                        sources,
+                        &mask,
+                        scorer.as_ref(),
+                        &mut stats,
+                    ));
+                }
+                combined_maxscore(
+                    &mut cursors,
+                    dl_prime,
+                    limit,
+                    require_all_terms,
+                    scorer.as_ref(),
+                    &mut stats,
+                )
+            }
+        };
+        Result::Ok((top, stats))
     })
     .await?;
 
@@ -192,12 +258,14 @@ pub async fn combined_fields_search_with_stats(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::encoding::MAX_POSTING_BLOCK_SIZE;
     use super::super::super::index::InvertedListFormatVersion;
     use super::super::super::scorer::idf;
     use super::super::super::tokenizer::document_tokenizer::DocType;
     use super::super::stats::{CombinedCorpusStats, build_combined_bm25_scorer};
     use super::super::testing::{
-        ElementRows, as_row_documents, combined_columns, combined_top_k, element_document_index,
+        ElementRows, as_row_documents, combined_columns, combined_top_k, combined_top_k_with_stats,
+        element_document_index,
     };
     use super::*;
     use crate::metrics::NoOpMetricsCollector;
@@ -240,6 +308,11 @@ mod tests {
             .unwrap();
         assert_eq!(title_docs.len(), 19, "one document per title list element");
         assert_eq!(title_docs.num_distinct_rows(), 10);
+        assert!(
+            !title_docs.addresses_strictly_ascending(),
+            "duplicate row addresses must reject the read-pruning fast path, whose `tf'` \
+             counts one posting per partition per row",
+        );
 
         // The single-column path reads document granularity; only the cross-field
         // path reads row granularity.
@@ -380,10 +453,11 @@ mod tests {
     ///
     /// Also the coverage for [`combined_fields_search_with_stats`] and its
     /// re-export: it is reached here through the gated crate path the bench uses,
-    /// and its top-k must be what plain [`combined_fields_search`] returns.
+    /// both counter groups included, and its top-k must be what plain
+    /// [`combined_fields_search`] returns.
     #[tokio::test]
     async fn test_combined_fields_search_with_stats_prunes_discovery() {
-        use crate::scalar::inverted::{MaxscoreStats, combined_fields_search_with_stats};
+        use crate::scalar::inverted::{CombinedScanStats, combined_fields_search_with_stats};
 
         const ROWS: usize = 40;
         let vocab = ["rare", "common"];
@@ -407,7 +481,7 @@ mod tests {
                 .unwrap();
         let params = FtsSearchParams::new().with_limit(Some(1));
 
-        let (row_ids, scores, stats): (Vec<u64>, Vec<f32>, MaxscoreStats) =
+        let (row_ids, scores, stats): (Vec<u64>, Vec<f32>, CombinedScanStats) =
             combined_fields_search_with_stats(
                 &columns,
                 &tokens,
@@ -428,6 +502,14 @@ mod tests {
             "only `rare`'s single posting drives discovery, not the {ROWS} rows \
              in the candidate union",
         );
+        // The read counters reach the same gated surface, and account the
+        // postings this corpus holds. They do not show pruning here: `common`'s
+        // 40 postings fit in one block, and probing `rare`'s single candidate
+        // decodes it whole. `test_combined_fields_read_pruning_engages` is the
+        // case sized to span blocks.
+        assert!(stats.postings_total >= ROWS as u64, "{stats:?}");
+        assert!(stats.blocks_read <= stats.blocks_total, "{stats:?}");
+        assert!(stats.postings_read <= stats.postings_total, "{stats:?}");
 
         // The delegating entry point must return exactly this, stats aside.
         let plain = combined_fields_search(
@@ -517,5 +599,121 @@ mod tests {
                 .map(|(row_id, score)| (*row_id, score.to_bits()))
                 .collect::<Vec<_>>(),
         );
+    }
+    /// Read pruning has to engage on a real index, not merely be implemented: a
+    /// gate that never fires leaves every score correct and silently disables
+    /// the pruning, and both arms return the same top-k, so read volume is the
+    /// only thing that tells them apart.
+    ///
+    /// `beta` spans several posting blocks while three `zeta` documents drive
+    /// discovery, so at `limit = 1` the threshold rises early, `beta` goes
+    /// non-essential, and most of its blocks are never decoded.
+    ///
+    /// The second case is the counterpart: one row holding two documents makes
+    /// the partition's row addresses non-ascending, which rejects the fast path,
+    /// so the fallback reads exactly the loads it was handed. Same corpus
+    /// otherwise, so the layout gate is the only variable.
+    #[rstest]
+    #[case::ascending_addresses_prune(false, true)]
+    #[case::duplicate_row_reads_everything(true, false)]
+    #[tokio::test]
+    async fn test_combined_fields_read_pruning_engages(
+        #[case] duplicate_row: bool,
+        #[case] expect_pruning: bool,
+    ) {
+        let format_version = InvertedListFormatVersion::V3;
+        // Sized in blocks of the widest posting layout, so `beta` spans several
+        // of them whichever block size the fixture is written with.
+        const NUM_DOCS: usize = 16 * MAX_POSTING_BLOCK_SIZE;
+        let has_zeta = |doc: usize| [3, NUM_DOCS / 2, NUM_DOCS - 5].contains(&doc);
+        let has_beta = |doc: usize| doc % 5 >= 2;
+
+        // One element per row, so every partition is fast-path eligible on the
+        // modern format. `gamma`/`delta` are filler: no query reads them, they
+        // only vary `dl'`.
+        let mut titles: ElementRows = (0..NUM_DOCS)
+            .map(|doc| {
+                let mut tokens = vec!["gamma"];
+                if has_zeta(doc) {
+                    tokens.push("zeta");
+                }
+                vec![tokens]
+            })
+            .collect();
+        if duplicate_row {
+            titles[0].push(vec!["gamma"]);
+        }
+        let bodies: ElementRows = (0..NUM_DOCS)
+            .map(|doc| {
+                vec![if has_beta(doc) {
+                    vec!["beta"; 1 + doc % 3]
+                } else {
+                    vec!["delta"]
+                }]
+            })
+            .collect();
+
+        // Derive the corpus shape from the same predicates, so it cannot drift
+        // away from what makes the pruning observable.
+        let count = |carries: &dyn Fn(usize) -> bool| (0..NUM_DOCS).filter(|d| carries(*d)).count();
+        let beta_docs = count(&has_beta);
+        let zeta_docs = count(&has_zeta);
+        assert!(
+            beta_docs > 4 * MAX_POSTING_BLOCK_SIZE && beta_docs < NUM_DOCS,
+            "beta must span several blocks without covering the corpus, got {beta_docs} of {NUM_DOCS}"
+        );
+        assert!(
+            zeta_docs < beta_docs / MAX_POSTING_BLOCK_SIZE,
+            "zeta ({zeta_docs} docs) must stay under beta's block count ({})",
+            beta_docs / MAX_POSTING_BLOCK_SIZE
+        );
+
+        let vocab = ["gamma", "zeta", "beta", "delta"];
+        let (title_index, _title_dir) =
+            element_document_index(format_version, &vocab, &titles).await;
+        let (body_index, _body_dir) = element_document_index(format_version, &vocab, &bodies).await;
+        // Precondition: the layout gate really is in the state this case wants.
+        assert_eq!(
+            title_index.partitions[0]
+                .docs
+                .address_keyed()
+                .await
+                .unwrap()
+                .addresses_strictly_ascending(),
+            !duplicate_row,
+            "the fixture must set up the layout gate it claims to"
+        );
+        let columns = combined_columns(vec![title_index, body_index]);
+
+        let (hits, stats) = combined_top_k_with_stats(&columns, &["zeta", "beta"], 1).await;
+        assert_eq!(
+            hits.len(),
+            1,
+            "the query must match something to read at all"
+        );
+        assert!(
+            stats.blocks_total > 0 && stats.postings_total > 0,
+            "the scan loaded no postings: {stats:?}"
+        );
+        if expect_pruning {
+            assert!(
+                2 * stats.blocks_read <= stats.blocks_total,
+                "expected block skipping, decoded {} of {} blocks",
+                stats.blocks_read,
+                stats.blocks_total,
+            );
+            assert!(
+                stats.postings_read < stats.postings_total,
+                "expected posting pruning, decoded {} of {} postings",
+                stats.postings_read,
+                stats.postings_total,
+            );
+        } else {
+            assert_eq!(
+                (stats.blocks_read, stats.postings_read),
+                (stats.blocks_total, stats.postings_total),
+                "the fallback reads exactly the loads it was handed",
+            );
+        }
     }
 }

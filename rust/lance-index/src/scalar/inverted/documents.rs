@@ -988,7 +988,9 @@ impl ResidentAddressProjection {
     /// so a contiguous DocId range spans a contiguous address interval. Row
     /// granularity relies on the second half: cross-field statistics count
     /// distinct rows, so an ascending partition can answer
-    /// [`AddressKeyedDocuments::num_distinct_rows`] without walking it.
+    /// [`AddressKeyedDocuments::num_distinct_rows`] without walking it. A
+    /// cross-column scan that seeks by address relies on both halves; see
+    /// [`AddressKeyedDocuments::addresses_strictly_ascending`].
     ///
     /// The ordering half is [`OrderedRowAddressProjection`], whose verdict this
     /// projection already caches for the cross-column scorer. Density is the
@@ -1270,7 +1272,7 @@ enum AddressKeyedSource {
         doc_ids_by_address: Arc<AddressDocIdLookup>,
         lengths: Arc<DocLengths>,
         /// Memoized per partition; see
-        /// [`ResidentAddressProjection::dense_and_strictly_ascending`].
+        /// [`AddressKeyedDocuments::addresses_strictly_ascending`].
         strictly_ascending: bool,
     },
 }
@@ -1325,6 +1327,22 @@ impl AddressKeyedDocuments {
                     u64::from(lengths.exact(DocId::new(doc_ids_by_address.doc_id_at(position))))
                 })
                 .sum(),
+        }
+    }
+
+    /// True iff every slot is live and row addresses ascend strictly with
+    /// `doc_id`, so DocId order equals address order and every row owns exactly
+    /// one document.
+    ///
+    /// A cross-column scan can then seek a posting list by address and skip whole
+    /// blocks: a block's address span is an interval, and a term contributes at
+    /// most one posting per partition per row.
+    pub(crate) fn addresses_strictly_ascending(&self) -> bool {
+        match &self.0 {
+            AddressKeyedSource::Legacy(docs) => docs.row_ids_strictly_ascending(),
+            AddressKeyedSource::Modern {
+                strictly_ascending, ..
+            } => *strictly_ascending,
         }
     }
 
@@ -1987,7 +2005,7 @@ impl PartitionDocuments {
         }))
     }
 
-    /// Answer to [`ResidentAddressProjection::dense_and_strictly_ascending`],
+    /// Answer to [`AddressKeyedDocuments::addresses_strictly_ascending`],
     /// memoized by the projection's own ordering cache. The validation scan is
     /// O(num_docs), so it belongs to prewarmed partition state.
     async fn strictly_ascending_addresses(
@@ -3160,6 +3178,7 @@ mod tests {
             "prewarm must leave the projection's ordering verdict cached"
         );
         let keyed = documents.address_keyed().await.unwrap();
+        assert_eq!(keyed.addresses_strictly_ascending(), strictly_ascending);
         assert_eq!(keyed.row_address(0), 10);
         assert_eq!(keyed.doc_length_at(30), 5);
         if strictly_ascending {
@@ -3200,6 +3219,7 @@ mod tests {
 
         for (label, keyed) in [("modern", &modern), ("legacy", &legacy)] {
             assert_eq!(keyed.len(), 0, "{label}");
+            assert!(keyed.addresses_strictly_ascending(), "{label}");
             assert_eq!(keyed.num_distinct_rows(), 0, "{label}");
         }
     }

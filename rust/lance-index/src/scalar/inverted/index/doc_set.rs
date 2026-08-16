@@ -342,8 +342,8 @@ impl DocSet {
     /// partitions regardless of this answer.
     ///
     /// Computed once per loaded set and memoized (shared across clones). An empty
-    /// set is vacuously ascending, matching the modern side's
-    /// `ResidentAddressProjection::dense_and_strictly_ascending`.
+    /// set is vacuously ascending, matching
+    /// `AddressKeyedDocuments::addresses_strictly_ascending`.
     pub fn row_ids_strictly_ascending(&self) -> bool {
         *self
             .row_ids_ascending

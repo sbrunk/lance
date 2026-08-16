@@ -20,7 +20,7 @@ use lance_core::cache::{LanceCache, WeakLanceCache};
 use lance_core::error::DataFusionResult;
 use lance_core::utils::tempfile::TempObjDir;
 use lance_io::object_store::ObjectStore;
-use lance_select::RowAddrTreeMap;
+use lance_select::{RowAddrMask, RowAddrTreeMap};
 use roaring::RoaringTreemap;
 
 use super::super::builder::{BLOCK_SIZE, InnerBuilder, PositionRecorder};
@@ -29,19 +29,19 @@ use super::super::encoding::{
     MAX_POSTING_BLOCK_SIZE, compress_posting_list_with_tail_codec_and_block_size,
 };
 use super::super::index::{
-    CompressedPostingList, FTS_FORMAT_VERSION_KEY, InvertedIndex, InvertedListFormatVersion,
-    METADATA_FILE, NUM_TOKEN_COL, POSTING_BLOCK_SIZE_KEY, POSTING_TAIL_CODEC_KEY,
-    PostingListBuilder, PostingTailCodec, TOKEN_SET_FORMAT_KEY, TokenSetFormat,
+    CompressedPostingList, DocSet, FTS_FORMAT_VERSION_KEY, InvertedIndex,
+    InvertedListFormatVersion, METADATA_FILE, NUM_TOKEN_COL, POSTING_BLOCK_SIZE_KEY,
+    POSTING_TAIL_CODEC_KEY, PostingListBuilder, PostingTailCodec, TOKEN_SET_FORMAT_KEY,
+    TokenSetFormat,
 };
 use super::super::query::{FtsSearchParams, Operator, Tokens};
 use super::super::scorer::CombinedFieldsBM25Scorer;
 use super::super::tokenizer::document_tokenizer::DocType;
 use super::super::tokenizer::{InvertedIndexParams, LEGACY_BLOCK_SIZE};
-use super::cursor::{CombinedTermPostings, MaterializedTerm};
-use super::maxscore::{MaxscoreStats, combined_maxscore, term_upper_bound};
-use super::{
-    CombinedCorpusStats, CombinedFieldColumn, build_combined_bm25_scorer, combined_fields_search,
-};
+use super::cursor::{CombinedTermPostings, FastPostingSource, LazyTerm, MaterializedTerm};
+use super::maxscore::{CombinedScanStats, combined_maxscore, term_upper_bound};
+use super::search::combined_fields_search_with_stats;
+use super::{CombinedCorpusStats, CombinedFieldColumn, build_combined_bm25_scorer};
 use crate::metrics::NoOpMetricsCollector;
 use crate::prefilter::NoFilter;
 use crate::scalar::lance_format::LanceIndexStore;
@@ -105,8 +105,16 @@ pub(super) fn maxscore_scores(
     limit: usize,
     require_all_terms: bool,
     scorer: &CombinedFieldsBM25Scorer,
-) -> (Vec<f32>, MaxscoreStats) {
-    let (top, stats) = combined_maxscore(cursors, dl_prime, limit, require_all_terms, scorer);
+) -> (Vec<f32>, CombinedScanStats) {
+    let mut stats = CombinedScanStats::default();
+    let top = combined_maxscore(
+        cursors,
+        dl_prime,
+        limit,
+        require_all_terms,
+        scorer,
+        &mut stats,
+    );
     let mut scores: Vec<f32> = top.into_iter().map(|Reverse(doc)| doc.score.0).collect();
     scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
     (scores, stats)
@@ -114,6 +122,13 @@ pub(super) fn maxscore_scores(
 
 pub(super) fn test_scorer() -> CombinedFieldsBM25Scorer {
     CombinedFieldsBM25Scorer::new(1000, 5.0, HashMap::new())
+}
+
+/// Per-column postings for one term: `columns[c]` is that column's ascending
+/// `(doc_id, freq)` list (empty when the term is absent from column `c`).
+pub(super) struct TermSpec {
+    pub(super) idf: f32,
+    pub(super) columns: Vec<Vec<(u32, u32)>>,
 }
 
 pub(super) fn compressed_list(postings: &[(u32, u32)]) -> CompressedPostingList {
@@ -139,6 +154,17 @@ pub(super) fn compressed_list(postings: &[(u32, u32)]) -> CompressedPostingList 
     )
 }
 
+/// Which [`AddressKeyedDocuments`] representation feeds the cursors.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum DocsSource {
+    /// The read-only view of a legacy partition's complete `DocSet`.
+    Legacy,
+    /// The per-partition projection every current index loads, and the only
+    /// representation `combined_fields_search` ever pairs with the fast path.
+    Modern,
+}
+
+/// A fragment-reuse stand-in that deletes exactly `dead_rows`.
 #[derive(Debug)]
 struct DeletedRows(Vec<u64>);
 
@@ -214,6 +240,199 @@ pub(super) async fn modern_identity_docs(
     .address_keyed()
     .await
     .unwrap()
+}
+
+/// Identity documents: `row_address(doc_id) == doc_id` (strictly ascending,
+/// one doc per row), with the given per-doc token counts for `dl'`.
+pub(super) async fn identity_docs(source: DocsSource, num_tokens: &[u32]) -> AddressKeyedDocuments {
+    match source {
+        DocsSource::Legacy => {
+            let row_ids = UInt64Array::from((0..num_tokens.len() as u64).collect::<Vec<_>>());
+            let num_tokens = UInt32Array::from(num_tokens.to_vec());
+            AddressKeyedDocuments::from_docset(Arc::new(
+                DocSet::from_columns(&row_ids, &num_tokens, false, None).unwrap(),
+            ))
+        }
+        DocsSource::Modern => modern_identity_docs(num_tokens, &[]).await,
+    }
+}
+
+pub(super) async fn assert_lazy_matches_materialized(
+    source: DocsSource,
+    column_num_tokens: &[Vec<u32>],
+    weights: &[f32],
+    terms: &[TermSpec],
+    avg_doc_length: f32,
+    mask: Arc<RowAddrMask>,
+    label: &str,
+) {
+    let label = &format!("{label}/{source:?}");
+    let mut docsets: Vec<AddressKeyedDocuments> = Vec::with_capacity(column_num_tokens.len());
+    for num_tokens in column_num_tokens {
+        docsets.push(identity_docs(source, num_tokens).await);
+    }
+    // Every docset must be fast-path eligible for this harness to exercise
+    // the lazy cursors at all.
+    assert!(
+        docsets.iter().all(|d| d.addresses_strictly_ascending()),
+        "{label}: identity docsets must be strictly ascending"
+    );
+    // Both representations must really answer the identity mapping and the
+    // requested lengths: the lazy cursors resolve every posting through
+    // `row_address`, while the materialized reference below keys on the doc
+    // id directly, and `dl_prime` reads `doc_length_at`.
+    for (column, num_tokens) in column_num_tokens.iter().enumerate() {
+        let docs = &docsets[column];
+        assert_eq!(
+            docs.len(),
+            num_tokens.len(),
+            "{label}: column {column} document count"
+        );
+        for (doc_id, expected) in num_tokens.iter().enumerate() {
+            assert_eq!(
+                docs.row_address(doc_id as u32),
+                doc_id as u64,
+                "{label}: column {column} doc {doc_id} address"
+            );
+            assert_eq!(
+                docs.doc_length_at(doc_id as u64),
+                u64::from(*expected),
+                "{label}: column {column} row {doc_id} length"
+            );
+        }
+    }
+    let scorer = CombinedFieldsBM25Scorer::new(1000, avg_doc_length, HashMap::new());
+    let length_sources: Vec<(f32, AddressKeyedDocuments)> = weights
+        .iter()
+        .zip(&docsets)
+        .map(|(w, d)| (*w, d.clone()))
+        .collect();
+    let dl_prime = |row_id: u64| -> f32 {
+        length_sources
+            .iter()
+            .map(|(w, d)| w * d.doc_length_at(row_id) as f32)
+            .sum()
+    };
+
+    let build_lazy = || -> Vec<LazyTerm> {
+        terms
+            .iter()
+            .map(|spec| {
+                let sources = spec
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, postings)| !postings.is_empty())
+                    .map(|(c, postings)| {
+                        FastPostingSource::new(
+                            weights[c],
+                            docsets[c].clone(),
+                            mask.clone(),
+                            compressed_list(postings),
+                        )
+                    })
+                    .collect();
+                LazyTerm::new(spec.idf, sources)
+            })
+            .collect()
+    };
+    // Reference merge, mirroring `build_materialized_term`: sum in column
+    // order, drop masked rows.
+    let build_mat = || -> Vec<MaterializedTerm> {
+        terms
+            .iter()
+            .map(|spec| {
+                let mut acc: HashMap<u64, f32> = HashMap::new();
+                for (c, postings) in spec.columns.iter().enumerate() {
+                    for (doc_id, freq) in postings {
+                        let row_id = *doc_id as u64;
+                        if !mask.selected(row_id) {
+                            continue;
+                        }
+                        *acc.entry(row_id).or_insert(0.0) += weights[c] * *freq as f32;
+                    }
+                }
+                let mut postings: Vec<(u64, f32)> = acc.into_iter().collect();
+                postings.sort_unstable_by_key(|(row_id, _)| *row_id);
+                MaterializedTerm::new(CombinedTermPostings {
+                    idf: spec.idf,
+                    upper_bound: term_upper_bound(spec.idf),
+                    postings,
+                })
+            })
+            .collect()
+    };
+
+    for require_all in [false, true] {
+        for k in [1usize, 2, 3, 5, 10, 50] {
+            let mut lazy = build_lazy();
+            let mut mat = build_mat();
+            let mut lazy_stats = CombinedScanStats::default();
+            let mut mat_stats = CombinedScanStats::default();
+            let lazy_top = combined_maxscore(
+                &mut lazy,
+                dl_prime,
+                k,
+                require_all,
+                &scorer,
+                &mut lazy_stats,
+            );
+            let mat_top =
+                combined_maxscore(&mut mat, dl_prime, k, require_all, &scorer, &mut mat_stats);
+
+            // Bit-exact scores AND row ids, in identical order.
+            let lazy_v: Vec<(u64, u32)> = lazy_top
+                .into_sorted_vec()
+                .into_iter()
+                .map(|Reverse(doc)| (doc.row_id.0, doc.score.0.to_bits()))
+                .collect();
+            let mat_v: Vec<(u64, u32)> = mat_top
+                .into_sorted_vec()
+                .into_iter()
+                .map(|Reverse(doc)| (doc.row_id.0, doc.score.0.to_bits()))
+                .collect();
+            assert_eq!(
+                lazy_v, mat_v,
+                "{label}: lazy top-k != materialized top-k (and={require_all}, k={k})"
+            );
+
+            // Independent exact oracle on scores, scoring every union doc
+            // with `dl_prime` (`mat` postings survive the maxscore run;
+            // only its cursor advanced).
+            let union: BTreeSet<u64> = mat
+                .iter()
+                .flat_map(|t| t.postings.postings.iter().map(|(row_id, _)| *row_id))
+                .collect();
+            let mut expected: Vec<f32> = union
+                .into_iter()
+                .filter_map(|row_id| {
+                    let dl = dl_prime(row_id);
+                    let mut score = 0.0f32;
+                    let mut missing = false;
+                    for t in &mat {
+                        let tf = t.postings.tf_prime(row_id);
+                        if tf <= 0.0 {
+                            missing = true;
+                            continue;
+                        }
+                        score += t.postings.idf * scorer.doc_weight(tf, dl);
+                    }
+                    (!(require_all && missing)).then_some(score)
+                })
+                .collect();
+            expected.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            expected.truncate(k);
+            let mut lazy_scores: Vec<f32> = lazy_v
+                .iter()
+                .map(|(_, bits)| f32::from_bits(*bits))
+                .collect();
+            lazy_scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
+            assert_eq!(
+                lazy_scores, expected,
+                "{label}: lazy scores != exact oracle (and={require_all}, k={k})"
+            );
+        }
+    }
 }
 
 /// `_rowid` plus one `Utf8` document column per entry of `docs`
@@ -425,6 +644,17 @@ pub(super) async fn combined_top_k(
     terms: &[&str],
     limit: usize,
 ) -> Vec<(u64, f32)> {
+    combined_top_k_with_stats(columns, terms, limit).await.0
+}
+
+/// [`combined_top_k`], also returning the scan's counters, so a test can tell
+/// the block-skipping fast path from the full-read fallback: both return the
+/// same top-k, so read volume is the only difference.
+pub(super) async fn combined_top_k_with_stats(
+    columns: &[CombinedFieldColumn],
+    terms: &[&str],
+    limit: usize,
+) -> (Vec<(u64, f32)>, CombinedScanStats) {
     let tokens = Tokens::new(
         terms.iter().map(|t| (*t).to_owned()).collect(),
         DocType::Text,
@@ -433,7 +663,7 @@ pub(super) async fn combined_top_k(
         .await
         .unwrap();
     let params = FtsSearchParams::new().with_limit(Some(limit));
-    let (row_ids, scores) = combined_fields_search(
+    let (row_ids, scores, stats) = combined_fields_search_with_stats(
         columns,
         &tokens,
         &params,
@@ -444,5 +674,5 @@ pub(super) async fn combined_top_k(
     )
     .await
     .unwrap();
-    row_ids.into_iter().zip(scores).collect()
+    (row_ids.into_iter().zip(scores).collect(), stats)
 }

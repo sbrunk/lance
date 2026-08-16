@@ -23,6 +23,14 @@
 //! constant per-term ceiling, ordinary MAXSCORE across terms) prunes candidate
 //! scoring for a top-k query without changing the top-k it returns; see
 //! [`combined_fields_search`].
+//!
+//! On the fast path (compressed postings whose partition `row_ids` are strictly
+//! ascending) the same MAXSCORE also prunes reads: each term's postings are a
+//! lazy, block-skipping cross-column cursor, so a non-essential term's posting
+//! blocks are never decoded when it is only probed at the sparse candidates the
+//! essential terms discover. Anything the fast path cannot prove safe (legacy
+//! layout, unsorted `row_ids`, non-compressed postings) falls back to a full
+//! read whose result is bit-identical.
 
 mod cursor;
 mod flat;
@@ -39,10 +47,10 @@ use lance_core::{Error, Result};
 pub use flat::flat_combined_fields_search_stream;
 pub use search::combined_fields_search;
 pub use stats::{CombinedCorpusStats, FlatFieldStats, build_combined_bm25_scorer};
-// The MAXSCORE candidate counters, for test and bench targets only; see the
-// `test-scan-stats` feature.
+// The scan's candidate and read counters, for test and bench targets only; see
+// the `test-scan-stats` feature.
 #[cfg(any(test, feature = "test-scan-stats"))]
-pub use {maxscore::MaxscoreStats, search::combined_fields_search_with_stats};
+pub use {maxscore::CombinedScanStats, search::combined_fields_search_with_stats};
 
 use super::index::InvertedIndex;
 use super::query::Tokens;

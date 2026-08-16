@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 //! The term-at-a-time MAXSCORE loop shared by both `combined_fields` term
-//! cursors, its per-term score ceiling, and its candidate-work accounting.
+//! cursors, its per-term score ceiling, and the scan's work accounting.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -36,17 +36,26 @@ pub(super) fn term_upper_bound(idf: f32) -> f32 {
     }
 }
 
-/// Candidate-work accounting for one MAXSCORE run: the scoring-side work the
-/// essential/non-essential split saves.
+/// Work accounting for one `combined_fields` scan: the candidate scoring the
+/// essential/non-essential split saves, and the posting reads its block skipping
+/// saves on top of that.
 ///
-/// Per-candidate bookkeeping does not belong on the production
-/// `MetricsCollector`, so this never leaves the crate on a normal build: the
-/// `maxscore` module is private and only `cfg(test)` or the `test-scan-stats`
-/// feature re-exports it, alongside `combined_fields_search_with_stats`. The
-/// unit tests below are what keep the pruning honest: a gate that never fired
-/// would leave every score correct and silently do nothing.
+/// One struct for both: the same essential/non-essential split drives both
+/// prunes, and one scan fills both sets of counters in a single pass. Each side
+/// fills its own: the cursors account the reads (see
+/// [`record_fast_reads`](super::cursor::record_fast_reads) and
+/// [`build_materialized_term`](super::cursor::build_materialized_term)),
+/// [`combined_maxscore`] the candidates.
+///
+/// Per-candidate, per-block and per-posting bookkeeping does not belong on the
+/// production `MetricsCollector`, so this never leaves the crate on a normal
+/// build: the `maxscore` module is private and only `cfg(test)` or the
+/// `test-scan-stats` feature re-exports it, alongside
+/// `combined_fields_search_with_stats`. The unit tests are what keep the pruning
+/// honest: a gate that never fired would leave every score correct and silently
+/// do nothing.
 #[derive(Default, Debug, Clone, Copy)]
-pub struct MaxscoreStats {
+pub struct CombinedScanStats {
     /// Candidates pulled from the essential terms' cursors.
     pub discovered: u64,
     /// Discovered candidates skipped by the upper-bound test (no length lookup,
@@ -54,6 +63,16 @@ pub struct MaxscoreStats {
     pub pruned: u64,
     /// Candidates fully scored.
     pub scored: u64,
+    /// Posting blocks in the loaded lists, i.e. what a full read decodes.
+    pub blocks_total: u64,
+    /// Posting blocks actually decoded. Below `blocks_total` only when block
+    /// skipping engaged.
+    pub blocks_read: u64,
+    /// Postings in the loaded lists, i.e. what a full read decodes.
+    pub postings_total: u64,
+    /// Postings actually decoded, at block granularity: a decoded block counts
+    /// all of its postings, whether or not the scan looked at them.
+    pub postings_read: u64,
 }
 
 /// Term-at-a-time MAXSCORE over the cross-field combined postings.
@@ -80,13 +99,17 @@ pub struct MaxscoreStats {
 /// summation that produces `score` ([`score_sum_upper_bound_factor`]).
 ///
 /// Generic over [`TermCursor`], so the lazy and eager paths share one algorithm.
+///
+/// The candidate counters are accumulated into `stats`, which the caller also
+/// uses for the cursors' read counters, so one scan reports one set of stats.
 pub(super) fn combined_maxscore<C: TermCursor>(
     cursors: &mut [C],
     dl_prime: impl Fn(u64) -> f32,
     limit: usize,
     require_all_terms: bool,
     scorer: &CombinedFieldsBM25Scorer,
-) -> (BinaryHeap<Reverse<RankedDoc>>, MaxscoreStats) {
+    stats: &mut CombinedScanStats,
+) -> BinaryHeap<Reverse<RankedDoc>> {
     let num_terms = cursors.len();
     // Term indices ordered ascending by ceiling; ties broken by index so the
     // essential/non-essential split is deterministic.
@@ -102,7 +125,6 @@ pub(super) fn combined_maxscore<C: TermCursor>(
     let bound_factor = score_sum_upper_bound_factor(num_terms);
 
     let mut top: BinaryHeap<Reverse<RankedDoc>> = BinaryHeap::new();
-    let mut stats = MaxscoreStats::default();
     // The current k-th score; pruning is armed only once the heap is full.
     let mut threshold = f32::NEG_INFINITY;
     // Per-term score contributions, reused across candidates. Every scored
@@ -159,14 +181,16 @@ pub(super) fn combined_maxscore<C: TermCursor>(
         // then dominates the full `score`, so the prune below is safe (see this
         // function's doc comment).
         //
-        // The prune stays `Exclusive` (reject on `upper_bound <= threshold`) even
-        // though the collector now orders on `(score DESC, row_id ASC)`. A
-        // candidate that merely ties the k-th score cannot belong in the top-k
-        // here: `doc` only ever increases, so every candidate reaching this point
-        // has a higher row id than every incumbent, and an incumbent tied at
-        // `threshold` therefore wins the tiebreak. Rejecting on the tie is what the
-        // collector below does too, so the prune drops nothing the collector would
-        // have kept. See `test_combined_maxscore_ties_keep_lowest_row_ids`.
+        // The block-skip and candidate prunes both stay `Exclusive` (reject on
+        // `upper_bound <= threshold`) even though the collector now orders on
+        // `(score DESC, row_id ASC)`. A candidate that merely ties the k-th score
+        // cannot belong in the top-k here: `doc` only ever increases, so every
+        // candidate reaching this point has a higher row id than every incumbent,
+        // and an incumbent tied at `threshold` therefore wins the tiebreak.
+        // Rejecting on the tie is what the collector below does too, so neither
+        // prune drops anything the collector would have kept, and the blocks left
+        // unread belong only to candidates that lose. See
+        // `test_combined_maxscore_ties_keep_lowest_row_ids`.
         let mut essential_score = 0.0f32;
         let mut missing_term = false;
         for &term in &order[split..] {
@@ -195,7 +219,8 @@ pub(super) fn combined_maxscore<C: TermCursor>(
         }
 
         // Probe the non-essential terms on demand to complete the exact score.
-        // `doc` increases monotonically, so each probe seeks forward.
+        // `doc` increases monotonically, so each probe seeks forward and skips
+        // the intervening blocks (fast path).
         for &term in &order[..split] {
             let tf = cursors[term].probe(doc);
             missing_term |= tf <= 0.0;
@@ -229,7 +254,7 @@ pub(super) fn combined_maxscore<C: TermCursor>(
         }
     }
 
-    (top, stats)
+    top
 }
 
 #[cfg(test)]
@@ -285,7 +310,8 @@ mod tests {
         let build = || [term(5.0, &tied)];
 
         for limit in [1usize, 3, 5] {
-            let (top, stats) = combined_maxscore(&mut build(), dl_of, limit, false, &scorer);
+            let mut stats = CombinedScanStats::default();
+            let top = combined_maxscore(&mut build(), dl_of, limit, false, &scorer, &mut stats);
             let hits: Vec<u64> = top
                 .into_sorted_vec()
                 .into_iter()
