@@ -22,7 +22,10 @@ use arrow_array::{
     types::{Float32Type, Int32Type, Int64Type},
 };
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
-use arrow_schema::{DataType, Field as ArrowField, Fields as ArrowFields, Schema as ArrowSchema};
+use arrow_schema::{
+    DataType, Field as ArrowField, Field, Fields as ArrowFields, Schema as ArrowSchema,
+};
+use lance_arrow::ARROW_EXT_NAME_KEY;
 use lance_core::ROW_ID;
 use lance_core::utils::tempfile::TempStrDir;
 use lance_index::optimize::OptimizeOptions;
@@ -35,6 +38,7 @@ use lance_index::scalar::inverted::{
 use lance_index::{IndexType, scalar::ScalarIndexParams};
 use lance_select::{RowAddrMask, RowAddrTreeMap};
 
+use lance_arrow::json::ARROW_JSON_EXT_NAME;
 use lance_index::scalar::inverted::builder::BLOCK_SIZE;
 use lance_index::scalar::inverted::oracle::{brute_force_bm25f, brute_force_ids};
 use lance_index::scalar::inverted::query::{CombinedFieldsQuery, FtsQuery, MultiMatchQuery};
@@ -2399,4 +2403,183 @@ async fn test_fts_combined_fields_nested_columns() {
             "id {id}: scan={score}, brute force={want}"
         );
     }
+}
+
+/// An `arrow.json`-tagged field. Lance stores it as JSONB, so the scan reads it
+/// back as `LargeBinary` and the flat path has to wrap the stream in a
+/// `JsonTextStream` to get text out of it.
+fn json_field(name: &str) -> Field {
+    Field::new(name, DataType::Utf8, false).with_metadata(HashMap::from([(
+        ARROW_EXT_NAME_KEY.to_string(),
+        ARROW_JSON_EXT_NAME.to_string(),
+    )]))
+}
+
+/// JSON-tokenizing index params. `combined_fields` needs one tokenizer
+/// configuration across its target columns, so every column uses these.
+fn combined_fields_json_params() -> InvertedIndexParams {
+    InvertedIndexParams::default()
+        .lance_tokenizer("json".to_string())
+        .stem(false)
+        .remove_stop_words(false)
+}
+
+/// Assert the preconditions the JSON `combined_fields` cases rely on: the plan has
+/// a flat child, and the JSON column really reads back as JSONB, so that child has
+/// to wrap its input in a `JsonTextStream`.
+async fn assert_json_combined_fields_flat_plan(dataset: &Dataset, columns: &[&str]) {
+    let arrow_schema = ArrowSchema::from(dataset.schema());
+    let jsonb_columns = arrow_schema
+        .fields()
+        .iter()
+        .filter(|field| field.data_type() == &DataType::LargeBinary)
+        .count();
+    assert!(
+        jsonb_columns > 0,
+        "expected at least one JSONB-stored column, got {arrow_schema:?}"
+    );
+
+    let mut scan = dataset.scan();
+    scan.project(&["id"])
+        .unwrap()
+        .full_text_search(FullTextSearchQuery::new_query(combined_query_over(
+            columns,
+            "Title,str,alpha",
+            Operator::Or,
+            None,
+        )))
+        .unwrap();
+    let plan = scan.explain_plan(true).await.unwrap();
+    assert!(
+        plan.contains("FlatCombinedFields"),
+        "coverage is mixed, so the plan must carry a flat child:\n{plan}"
+    );
+}
+
+#[tokio::test]
+async fn test_fts_combined_fields_json_columns() {
+    // Two JSON target columns. The flat plan wraps its input in one
+    // `JsonTextStream` per target column, so the inner stream's declared schema has
+    // to list every column: the outer wrapper resolves its own column by name
+    // against it, and `doc_col_indices` resolves both columns by name against the
+    // final schema. A wrapper that declared only its own column would fail the query
+    // outright, and a by-index lookup would read whichever column sits at position 0,
+    // so both JSON columns are placed at non-zero positions here.
+    let params = combined_fields_json_params();
+    let docs_a = [r#"{"Title": "alpha"}"#, r#"{"Title": "alpha"}"#];
+    let docs_b = [r#"{"Title": "beta"}"#, r#"{"Title": "gamma"}"#];
+    // `record_batch!` cannot carry the `arrow.json` extension metadata these fields
+    // need, so the schema stays explicit here.
+    let batch = |ids: Vec<i32>, rows: std::ops::Range<usize>| {
+        RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                json_field("doc_a"),
+                json_field("doc_b"),
+            ])
+            .into(),
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(docs_a[rows.clone()].to_vec())) as ArrayRef,
+                Arc::new(StringArray::from(docs_b[rows].to_vec())) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    };
+
+    let test_uri = TempStrDir::default();
+    let mut dataset = write_fts_dataset(&test_uri, batch(vec![0], 0..1), None).await;
+    create_inverted_indices(&mut dataset, &["doc_a", "doc_b"], &params).await;
+    // Append so coverage is mixed and the flat child is planned.
+    let dataset = write_fts_dataset(
+        &test_uri,
+        batch(vec![1], 1..2),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await;
+
+    assert_json_combined_fields_flat_plan(&dataset, &["doc_a", "doc_b"]).await;
+
+    let ids = |terms: &str| {
+        let query = combined_query_over(&["doc_a", "doc_b"], terms, Operator::Or, None);
+        async {
+            fts_result_ids(&dataset, query)
+                .await
+                .into_iter()
+                .collect::<HashSet<_>>()
+        }
+    };
+    // Present in `doc_a` of both rows, so the indexed and the flat child each
+    // contribute one.
+    assert_eq!(ids("Title,str,alpha").await, HashSet::from([0, 1]));
+    // Only in `doc_b` of the appended row: reachable only if the flat scan tokenizes
+    // `doc_b` rather than reading `doc_a` twice.
+    assert_eq!(ids("Title,str,gamma").await, HashSet::from([1]));
+    // Only in the second JSON column of the indexed row.
+    assert_eq!(ids("Title,str,beta").await, HashSet::from([0]));
+}
+
+#[tokio::test]
+async fn test_fts_combined_fields_json_and_text_columns() {
+    // One JSON column and one plain `Utf8` column, with the JSON column at a
+    // non-zero schema position. Only the JSON column gets a `JsonTextStream`, so
+    // the text column has to stay resolvable by name through that wrapper. The
+    // `Utf8` column holds JSON text and is indexed with the JSON tokenizer
+    // explicitly, because `combined_fields` requires one shared tokenizer
+    // configuration and a JSON column infers `json` from its type.
+    let params = combined_fields_json_params();
+    let texts = [r#"{"Title": "alpha"}"#, r#"{"Title": "delta"}"#];
+    let docs = [r#"{"Title": "beta"}"#, r#"{"Title": "gamma"}"#];
+    // `record_batch!` cannot carry the `arrow.json` extension metadata `doc` needs,
+    // so the schema stays explicit here.
+    let batch = |ids: Vec<i32>, rows: std::ops::Range<usize>| {
+        RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("text", DataType::Utf8, false),
+                json_field("doc"),
+            ])
+            .into(),
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(texts[rows.clone()].to_vec())) as ArrayRef,
+                Arc::new(StringArray::from(docs[rows].to_vec())) as ArrayRef,
+            ],
+        )
+        .unwrap()
+    };
+
+    let test_uri = TempStrDir::default();
+    let mut dataset = write_fts_dataset(&test_uri, batch(vec![0], 0..1), None).await;
+    create_inverted_indices(&mut dataset, &["text", "doc"], &params).await;
+    let dataset = write_fts_dataset(
+        &test_uri,
+        batch(vec![1], 1..2),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await;
+
+    assert_json_combined_fields_flat_plan(&dataset, &["text", "doc"]).await;
+
+    let ids = |terms: &str| {
+        let query = combined_query_over(&["text", "doc"], terms, Operator::Or, None);
+        async {
+            fts_result_ids(&dataset, query)
+                .await
+                .into_iter()
+                .collect::<HashSet<_>>()
+        }
+    };
+    // The appended row is on the flat side; both of its columns must be readable
+    // through the single JSON wrapper.
+    assert_eq!(ids("Title,str,delta").await, HashSet::from([1]));
+    assert_eq!(ids("Title,str,gamma").await, HashSet::from([1]));
+    assert_eq!(ids("Title,str,alpha").await, HashSet::from([0]));
+    assert_eq!(ids("Title,str,beta").await, HashSet::from([0]));
 }

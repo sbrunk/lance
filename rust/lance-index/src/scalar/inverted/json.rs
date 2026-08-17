@@ -13,12 +13,42 @@ use std::task::{Context, Poll};
 pub struct JsonTextStream {
     inner: SendableRecordBatchStream,
     jsonb_col: String,
+    schema: SchemaRef,
 }
 
 impl JsonTextStream {
     pub fn new(inner: SendableRecordBatchStream, jsonb_col: String) -> Self {
-        Self { inner, jsonb_col }
+        let schema = json_text_schema(inner.schema().as_ref(), &jsonb_col);
+        Self {
+            inner,
+            jsonb_col,
+            schema,
+        }
     }
+}
+
+/// The schema `JsonTextStream` yields: every input field, with `jsonb_col`
+/// retyped from JSONB to text.
+///
+/// This must mirror what `poll_next` builds. Reporting only `jsonb_col` would
+/// make `schema()` disagree with the batches on both field count and position, so
+/// a caller resolving another column by name would fail, and one resolving
+/// `jsonb_col` positionally would silently read whichever column happens to sit
+/// at position 0.
+fn json_text_schema(input_schema: &Schema, jsonb_col: &str) -> SchemaRef {
+    Arc::new(Schema::new(
+        input_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                if field.name().as_str() == jsonb_col {
+                    Field::new(jsonb_col, DataType::LargeUtf8, true)
+                } else {
+                    field.as_ref().clone()
+                }
+            })
+            .collect::<Vec<Field>>(),
+    ))
 }
 
 impl Stream for JsonTextStream {
@@ -41,20 +71,7 @@ impl Stream for JsonTextStream {
                     })
                     .collect::<lance_core::Result<Vec<ArrayRef>>>()?;
 
-                let new_schema = batch
-                    .schema()
-                    .fields()
-                    .iter()
-                    .map(|col| {
-                        if col.name().as_str() == self.jsonb_col {
-                            Field::new(&self.jsonb_col, DataType::LargeUtf8, true)
-                        } else {
-                            col.as_ref().clone()
-                        }
-                    })
-                    .collect::<Vec<Field>>();
-                let new_schema = Arc::new(Schema::new(new_schema));
-                let mapped = RecordBatch::try_new(new_schema, cols).unwrap();
+                let mapped = RecordBatch::try_new(self.schema.clone(), cols).unwrap();
                 Poll::Ready(Some(Ok(mapped)))
             }
             Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
@@ -66,11 +83,7 @@ impl Stream for JsonTextStream {
 
 impl RecordBatchStream for JsonTextStream {
     fn schema(&self) -> SchemaRef {
-        Arc::new(Schema::new(vec![Field::new(
-            &self.jsonb_col,
-            DataType::Utf8,
-            true,
-        )]))
+        self.schema.clone()
     }
 }
 
@@ -102,6 +115,7 @@ mod tests {
     use arrow_array::cast::AsArray;
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    use datafusion::execution::RecordBatchStream;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{TryStreamExt, stream};
     use serde_json::Value;
@@ -144,6 +158,10 @@ mod tests {
         ));
 
         let json_text_stream = JsonTextStream::new(stream, "json_col".to_string());
+        // The declared stream schema must match the batches. Callers resolve other
+        // columns by name and this one by index against it, so a schema listing
+        // only the JSONB column would break both.
+        let declared_schema = json_text_stream.schema();
 
         let result_batches: Vec<RecordBatch> = json_text_stream.try_collect().await.unwrap();
         assert_eq!(result_batches.len(), 1);
@@ -153,6 +171,7 @@ mod tests {
             Field::new("json_col", DataType::LargeUtf8, true),
             Field::new("rowid", DataType::UInt64, false),
         ]));
+        assert_eq!(declared_schema, expected_schema);
         assert_eq!(result_batch.schema(), expected_schema);
 
         let json_text_col = result_batch
